@@ -1,48 +1,24 @@
 #!/bin/bash
 
 # =========================================================
-# NanoPC-T6 (RK3588) 终极优化脚本 v3.0 (含代理联动版)
-# 修订：自动补全 irqbalance、SmartDNS、锁定 8 核主频、适配多 IP 分流
+# NanoPC-T6 (RK3588) 零手动、全自动优化脚本 v4.0
+# 功能：自动安装、自动配置、自动启动 SmartDNS & irqbalance
 # =========================================================
 
-echo "🚀 正在为您的 NanoPC-T6 注入狂暴性能..."
+echo "🚀 开启全自动性能注入，请稍后..."
 
-# 1. 自动补全所有缺失的优化组件
-echo "📦 正在安装核心组件 (SmartDNS, irqbalance, BBR)..."
+# 1. 一键安装组件 (包含核心程序与界面)
+echo "📦 正在后台安装 SmartDNS 与 irqbalance..."
 opkg update
-# 核心解析：smartdns + luci 界面
-opkg install smartdns luci-app-smartdns
-# 核心调度：irqbalance (8核均衡) + ethtool
-opkg install irqbalance ethtool
-# 核心加速：BBR内核模块 + 流量调度
-opkg install kmod-tcp-bbr kmod-sched-core
-# 辅助工具：htop (监控), ip-full (网络)
-opkg install htop ip-full coreutils-stat
+# 确保安装核心程序 smartdns, 界面 luci-app-smartdns, 以及平衡器 irqbalance
+opkg install smartdns luci-app-smartdns irqbalance ethtool ip-full kmod-tcp-bbr
 
-# 2. 启动并激活 irqbalance (关键：让 8 个核心平摊 2.5G 流量)
-/etc/init.d/irqbalance enable
-/etc/init.d/irqbalance start
+# 2. 【核心】SmartDNS 自动化配置与强制开启
+echo "🌐 正在全自动配置 SmartDNS..."
+# 停止服务防止占用
+/etc/init.d/smartdns stop 2>/dev/null
 
-# 3. 内核加速配置 (BBR + 104万连接数)
-echo "⚡ 优化内核传输协议栈..."
-cat > /etc/sysctl.conf <<EOF
-net.core.default_qdisc=fq_codel
-net.ipv4.tcp_congestion_control=bbr
-net.netfilter.nf_conntrack_max=1048576
-net.netfilter.nf_conntrack_tcp_timeout_established=3600
-net.core.rmem_max=16777216
-net.core.wmem_max=16777216
-net.ipv4.tcp_rmem=4096 87380 16777216
-net.ipv4.tcp_wmem=4096 65536 16777216
-fs.file-max=1000000
-# 针对链式代理优化 UDP 队列
-net.core.netdev_max_backlog=5000
-EOF
-sysctl -p
-
-# 4. SmartDNS 极致配置与 DNS 闭环
-echo "🌐 配置 SmartDNS 解析引擎 (端口 6053)..."
-rm -f /etc/config/smartdns
+# 写入配置文件 (直接覆盖，确保索引正确)
 cat > /etc/config/smartdns <<EOF
 config smartdns
     option enabled '1'
@@ -65,41 +41,56 @@ config server
     option ip '119.29.29.29'
     option type 'udp'
 EOF
+
+# 启用服务、提交配置并立即启动
 uci commit smartdns
 /etc/init.d/smartdns enable
-/etc/init.d/smartdns restart
+/etc/init.d/smartdns start
 
-# 联动 dnsmasq
+# 3. 【核心】irqbalance 自动化安装与立即启用
+echo "⚖️ 正在激活 8 核多核中断平衡..."
+# 设置为开机启动并立即运行
+/etc/init.d/irqbalance enable
+/etc/init.d/irqbalance start
+
+# 4. 【核心】内核 BBR 与 2.5G 网口优化
+echo "⚡ 正在注入内核加速参数..."
+cat > /etc/sysctl.conf <<EOF
+net.core.default_qdisc=fq_codel
+net.ipv4.tcp_congestion_control=bbr
+net.netfilter.nf_conntrack_max=1048576
+net.core.rmem_max=16777216
+net.core.wmem_max=16777216
+net.ipv4.tcp_rmem=4096 87380 16777216
+net.ipv4.tcp_wmem=4096 65536 16777216
+EOF
+sysctl -p
+
+# 5. DNS 闭环：让 dnsmasq 强制跳转到 SmartDNS
+echo "🔗 正在打通 DNS 解析闭环..."
 uci del_list dhcp.@dnsmasq[0].server='127.0.0.1#6053' 2>/dev/null
 uci add_list dhcp.@dnsmasq[0].server='127.0.0.1#6053'
 uci set dhcp.@dnsmasq[0].noresolv='1'
 uci commit dhcp
 /etc/init.d/dnsmasq restart
 
-# 5. 防火墙 FW4 性能优化 (Flow Offloading)
-uci set firewall.@defaults[0].flow_offloading='1'
-uci set firewall.@zone[1].fullcone4='1'
-uci commit firewall
-/etc/init.d/firewall restart
-
-# 6. 持久化：8 核满频锁定 + 网卡队列加速
+# 6. 持久化：将“性能模式”写入 rc.local (确保重启后配置不丢)
 cat > /etc/rc.local <<EOF
-# 适配 2.5G 网口队列
-for dev in \$(ls /sys/class/net | grep -E 'eth|enp|lan|wan'); do
-    ip link set \$dev txqueuelen 5000 2>/dev/null
-done
-
-# 锁定 RK3588 8核高性能 (防止跳频引起的延迟)
+# 满频锁定
 for i in \$(seq 0 7); do
-    if [ -f /sys/devices/system/cpu/cpu\$i/cpufreq/scaling_max_freq ]; then
-        MAX_FREQ=\$(cat /sys/devices/system/cpu/cpu\$i/cpufreq/scaling_max_freq)
-        echo "performance" > /sys/devices/system/cpu/cpu\$i/cpufreq/scaling_governor
-        echo \$MAX_FREQ > /sys/devices/system/cpu/cpu\$i/cpufreq/scaling_min_freq
-    fi
+    MAX_FREQ=\$(cat /sys/devices/system/cpu/cpu\$i/cpufreq/scaling_max_freq)
+    echo "performance" > /sys/devices/system/cpu/cpu\$i/cpufreq/scaling_governor
+    echo \$MAX_FREQ > /sys/devices/system/cpu/cpu\$i/cpufreq/scaling_min_freq
 done
+# 再次确保服务运行
+/etc/init.d/smartdns start
+/etc/init.d/irqbalance start
 exit 0
 EOF
 chmod +x /etc/rc.local
 /etc/rc.local
 
-echo "✅ 优化完成！您可以继续配置 OpenClash 的分流规则了。"
+echo "----------------------------------------------------"
+echo "✅ 全部完成！SmartDNS 和 irqbalance 已在后台全速运行。"
+echo "您可以执行 'ps | grep smartdns' 验证。无需任何手动操作。"
+echo "----------------------------------------------------"
