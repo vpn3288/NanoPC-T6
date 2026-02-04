@@ -1,16 +1,17 @@
 #!/bin/bash
 # ==============================================================================
-# NanoPC-T6 (16GB) 代理主路由专用优化脚本 v19.0
+# NanoPC-T6 (16GB) 代理主路由专用优化脚本 v20.0
 # ------------------------------------------------------------------------------
 # 硬件: RK3588 8核心 / 16GB 内存 / 64GB 存储 / 2x 2.5G 网口
 # 场景: 主路由 + 代理软件（OpenClash/HomeProxy/PassWall）
 # 特性: 高并发连接、低延迟、多核优化、代理友好
+# v20.0 更新: 禁用 irqbalance，使用 RPS（多队列网卡优化）
 # ==============================================================================
 
 set -e
 
 # --- 全局变量 ---
-LOG_FILE="/tmp/optimization_v19_$(date +%Y%m%d).log"
+LOG_FILE="/tmp/optimization_v20_$(date +%Y%m%d).log"
 BACKUP_DIR="/etc/config_backup_$(date +%Y%m%d_%H%M%S)"
 CPU_GOVERNOR="schedutil"  # 负载感应（推荐）或 performance（极致性能）
 TX_QUEUE_LEN="5000"
@@ -45,7 +46,7 @@ uci_delete_all() {
 }
 
 # --- 主流程 ---
-log_info "🚀 NanoPC-T6 代理主路由优化 v19.0"
+log_info "🚀 NanoPC-T6 代理主路由优化 v20.0"
 
 DEVICE_MODEL=$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo 'RK3588 Device')
 log_info "设备: $DEVICE_MODEL"
@@ -338,7 +339,7 @@ backup_file "/etc/rc.local"
 
 cat > /etc/rc.local <<EOF
 #!/bin/sh
-# NanoPC-T6 代理主路由启动脚本 (v19.0)
+# NanoPC-T6 代理主路由启动脚本 (v20.0)
 
 # 等待系统稳定
 sleep 5
@@ -360,15 +361,23 @@ for i in \$(seq 0 $((CPU_CORES - 1))); do
     fi
 done
 
-# 3. RPS/RFS 应用（热插拔已配置，此处备用）
-for dev in \$(ls /sys/class/net 2>/dev/null | grep -E 'eth|enp|lan|wan'); do
-    for queue in /sys/class/net/\$dev/queues/rx-*/rps_cpus; do
-        [ -f "\$queue" ] && echo "$RPS_MASK" > \$queue 2>/dev/null
-    done
+# 3. RPS/RFS 持久化（多队列网卡优化）
+# 等待网卡就绪
+sleep 2
+for dev in eth1 eth2; do
+    if [ -d /sys/class/net/\$dev/queues ]; then
+        # RPS: 所有核心
+        for queue in /sys/class/net/\$dev/queues/rx-*/rps_cpus; do
+            [ -f "\$queue" ] && echo "$RPS_MASK" > \$queue 2>/dev/null
+        done
+        # RFS: 流感知
+        for queue in /sys/class/net/\$dev/queues/rx-*/rps_flow_cnt; do
+            [ -f "\$queue" ] && echo "4096" > \$queue 2>/dev/null
+        done
+    fi
 done
 
-# 4. 确保 irqbalance 运行
-/etc/init.d/irqbalance start 2>/dev/null || true
+# 注意: irqbalance 已禁用，使用 RPS 代替（多队列网卡更优）
 
 exit 0
 EOF
@@ -379,31 +388,17 @@ log_info "✅ 启动项已配置 | 调频: $CPU_GOVERNOR"
 
 # ==================== 阶段 7: irqbalance ====================
 log_info ""
-log_info "⚖️ [7/7] 中断平衡服务..."
+log_info "⚖️ [7/7] 中断优化配置..."
 
-if [ ! -f /etc/config/irqbalance ]; then
-    cat > /etc/config/irqbalance <<'EOF'
-config irqbalance
-    option enabled '1'
-    option interval '10'
-EOF
-else
-    if ! uci -q get irqbalance.@irqbalance[0] >/dev/null 2>&1; then
-        uci add irqbalance irqbalance
-    fi
-    uci set irqbalance.@irqbalance[0].enabled='1'
-    uci set irqbalance.@irqbalance[0].interval='10'
-    uci commit irqbalance
-fi
+# 多队列网卡使用 RPS 更好，禁用 irqbalance 避免冲突
+log_info "检测到多队列网卡（eth1/eth2 各 4 队列）"
+log_info "使用 RPS 代替 irqbalance（更适合多队列网卡）"
 
-/etc/init.d/irqbalance enable >/dev/null 2>&1
-/etc/init.d/irqbalance restart >/dev/null 2>&1
-
-sleep 2
-if pgrep -x irqbalance >/dev/null; then
-    log_info "✅ irqbalance 运行中"
-else
-    log_warn "⚠️  irqbalance 未运行（重启后生效）"
+# 禁用 irqbalance
+if [ -f /etc/init.d/irqbalance ]; then
+    /etc/init.d/irqbalance stop 2>/dev/null || true
+    /etc/init.d/irqbalance disable 2>/dev/null || true
+    log_info "✅ 已禁用 irqbalance（避免与 RPS 冲突）"
 fi
 
 # ==================== 最终验证 ====================
