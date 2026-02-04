@@ -1,233 +1,446 @@
 #!/bin/bash
 # ==============================================================================
-# NanoPC-T6 (RK3588) 工业级全向容错优化脚本 v17.0
+# NanoPC-T6 (16GB) 代理主路由专用优化脚本 v19.0
 # ------------------------------------------------------------------------------
-# 适用：全新部署 / 二次覆盖 / 故障修复
-# 特性：自动纠错、环境自检、智能调度、无 SmartDNS 冲突
+# 硬件: RK3588 8核心 / 16GB 内存 / 64GB 存储 / 2x 2.5G 网口
+# 场景: 主路由 + 代理软件（OpenClash/HomeProxy/PassWall）
+# 特性: 高并发连接、低延迟、多核优化、代理友好
 # ==============================================================================
 
-# --- 全局变量定义 ---
-LOG_FILE="/tmp/optimization_v17_$(date +%Y%m%d).log"
+set -e
+
+# --- 全局变量 ---
+LOG_FILE="/tmp/optimization_v19_$(date +%Y%m%d).log"
 BACKUP_DIR="/etc/config_backup_$(date +%Y%m%d_%H%M%S)"
-TARGET_GOVERNOR="schedutil"  # 推荐调度：负载感应 (兼顾性能与散热)
-TX_QUEUE_LEN="5000"          # 2.5G 网卡最佳队列
+CPU_GOVERNOR="schedutil"  # 负载感应（推荐）或 performance（极致性能）
+TX_QUEUE_LEN="5000"
 
-# --- 核心工具函数 ---
-
-# 1. 日志系统
+# --- 日志函数 ---
 log_info() { echo -e "\033[32m[INFO] [$(date +'%H:%M:%S')] $1\033[0m" | tee -a "$LOG_FILE"; }
 log_warn() { echo -e "\033[33m[WARN] [$(date +'%H:%M:%S')] $1\033[0m" | tee -a "$LOG_FILE"; }
-log_err()  { echo -e "\033[31m[ERROR] [$(date +'%H:%M:%S')] $1\033[0m" | tee -a "$LOG_FILE"; }
+log_err()  { echo -e "\033[31m[ERROR] [$(date +'%H:%M:%S')] $1\033[0m" | tee -a "$LOG_FILE"; exit 1; }
 
-# 2. 安全备份 (防手滑)
+# --- 工具函数 ---
 backup_file() {
-    local file_path="$1"
-    if [ -f "$file_path" ]; then
+    if [ -f "$1" ]; then
         mkdir -p "$BACKUP_DIR"
-        cp "$file_path" "$BACKUP_DIR/"
-        log_info "💾 备份配置: $file_path -> $BACKUP_DIR/"
+        cp -a "$1" "$BACKUP_DIR/" 2>/dev/null
+        log_info "💾 备份: $1"
     fi
 }
 
-# 3. 网络自检 (防止断网导致 opkg 报错)
 check_network() {
-    log_info "🔍 环境自检: 正在测试网络连通性..."
-    if ping -c 3 223.5.5.5 >/dev/null 2>&1; then
-        log_info "✅ 网络连接正常"
-    else
-        log_err "❌ 无法连接互联网，请检查 WAN 口！脚本终止以保护系统。"
-        exit 1
-    fi
+    log_info "🔍 网络自检..."
+    for host in 223.5.5.5 119.29.29.29 1.1.1.1; do
+        if ping -c 2 -W 3 "$host" >/dev/null 2>&1; then
+            log_info "✅ 网络正常 (测试节点: $host)"
+            return 0
+        fi
+    done
+    log_err "❌ 网络异常，请检查 WAN 口"
 }
 
-# --- 主逻辑开始 ---
+uci_delete_all() {
+    while uci -q delete "$1" 2>/dev/null; do :; done
+}
 
-log_info "🚀 开始执行 v17.0 全向容错部署..."
-log_info "设备型号: $(cat /proc/device-tree/model 2>/dev/null || echo 'Unknown RK3588 Device')"
+# --- 主流程 ---
+log_info "🚀 NanoPC-T6 代理主路由优化 v19.0"
 
-# 0. 权限检查
-if [ "$(id -u)" -ne 0 ]; then
-    log_err "权限不足，请使用 root 运行！"
-    exit 1
-fi
+DEVICE_MODEL=$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo 'RK3588 Device')
+log_info "设备: $DEVICE_MODEL"
+
+# 检测内存
+TOTAL_MEM=$(free -m | awk 'NR==2 {print $2}')
+log_info "内存: ${TOTAL_MEM}MB"
+
+[ "$(id -u)" -eq 0 ] || log_err "需要 root 权限"
 check_network
 
-# 1. 冲突清洗 (最关键的一步：无论你是否安装过，都检查一遍)
-log_info "🧹 [阶段 1/6] 智能清洗潜在冲突组件..."
+# ==================== 阶段 1: 环境清理 ====================
+log_info ""
+log_info "🧹 [1/7] 环境清理..."
 
-# >>> SmartDNS 清洗逻辑 <<<
-# 即使你现在没装，万一以后手滑装了，或者旧配置残留，这里都会强制清理
-if opkg list-installed | grep -q "smartdns"; then
-    log_warn "发现 SmartDNS 组件，正在为了系统纯净性进行移除..."
-    /etc/init.d/smartdns stop 2>/dev/null
-    /etc/init.d/smartdns disable 2>/dev/null
-    opkg remove luci-app-smartdns smartdns --force-removal >/dev/null 2>&1
-    # 彻底删除残留配置，防止尸位素餐
-    rm -rf /etc/config/smartdns
-    log_info "✅ SmartDNS 已彻底卸载，端口 53/6053 已释放。"
+# SmartDNS 清理（代理软件需要接管 DNS）
+if opkg list-installed 2>/dev/null | grep -q "smartdns"; then
+    log_warn "检测到 SmartDNS，正在移除（避免与代理冲突）..."
+    /etc/init.d/smartdns stop 2>/dev/null || true
+    /etc/init.d/smartdns disable 2>/dev/null || true
+    opkg remove luci-app-smartdns smartdns --force-removal-of-dependent-packages >/dev/null 2>&1 || true
+    rm -rf /etc/config/smartdns /etc/smartdns 2>/dev/null
+    log_info "✅ SmartDNS 已移除"
 else
-    log_info "✅ 未发现 SmartDNS，环境纯净。"
+    log_info "✅ 环境纯净"
 fi
 
-# >>> Dnsmasq 重置逻辑 <<<
-# 这一步是为了确保 Dnsmasq 回归“标准傻瓜模式”，方便代理软件接管
-log_info "正在校验 Dnsmasq 配置..."
+# Dnsmasq 重置（为代理软件准备）
+log_info "重置 dnsmasq 配置..."
 backup_file "/etc/config/dhcp"
-# 无论原本怎么改的，强制删掉 server 指向，回归默认
-uci -q del dhcp.@dnsmasq[0].server
-uci -q set dhcp.@dnsmasq[0].noresolv='0'
-uci -q set dhcp.@dnsmasq[0].cachesize='2000' # 扩容缓存
+
+uci_delete_all "dhcp.@dnsmasq[0].server"
+uci set dhcp.@dnsmasq[0].noresolv='0'
+uci set dhcp.@dnsmasq[0].cachesize='5000'  # 代理场景：适中缓存
+uci set dhcp.@dnsmasq[0].min_cache_ttl='600'  # 10分钟
 uci commit dhcp
-/etc/init.d/dnsmasq restart
-log_info "✅ Dnsmasq 已重置为标准路由模式。"
 
-# 2. 软件包补全 (支持重复运行，已安装的自动跳过)
-log_info "📦 [阶段 2/6] 校验并补全核心组件..."
-opkg update >/dev/null 2>&1
+# 安全重启 dnsmasq
+/etc/init.d/dnsmasq restart &
+DNSMASQ_PID=$!
+count=0
+while [ $count -lt 10 ]; do
+    if ! kill -0 $DNSMASQ_PID 2>/dev/null; then
+        wait $DNSMASQ_PID 2>/dev/null
+        break
+    fi
+    sleep 1
+    count=$((count + 1))
+done
 
-# 必装清单
-PKG_LIST="luci-app-turboacc irqbalance ethtool ip-full kmod-tcp-bbr kmod-sched-core bind-host coreutils-stat"
+if kill -0 $DNSMASQ_PID 2>/dev/null; then
+    log_warn "dnsmasq 重启超时，强制处理..."
+    kill -9 $DNSMASQ_PID 2>/dev/null || true
+    killall dnsmasq 2>/dev/null || true
+    sleep 1
+    /etc/init.d/dnsmasq start
+fi
+
+sleep 2
+log_info "✅ dnsmasq 已重置为代理兼容模式"
+
+# ==================== 阶段 2: 软件包安装 ====================
+log_info ""
+log_info "📦 [2/7] 核心组件安装..."
+opkg update >/dev/null 2>&1 || log_warn "软件源更新失败"
+
+PKG_LIST="irqbalance ethtool ip-full kmod-tcp-bbr kmod-sched-core bind-host coreutils-stat"
 
 for pkg in $PKG_LIST; do
-    if opkg list-installed | grep -q "^$pkg"; then
-        log_info "  ⏭️  $pkg 已安装 (跳过)"
+    if opkg list-installed 2>/dev/null | grep -q "^$pkg "; then
+        log_info "  ⏭️  $pkg"
     else
-        log_info "  ⬇️  正在安装 $pkg..."
-        if opkg install "$pkg" >> "$LOG_FILE" 2>&1; then
-            log_info "  ✅ $pkg 安装成功"
-        else
-            log_warn "  ⚠️  $pkg 安装失败 (可能是源暂时不可用，不影响核心功能)"
-        fi
+        log_info "  ⬇️  安装 $pkg..."
+        opkg install "$pkg" >> "$LOG_FILE" 2>&1 || log_warn "  ⚠️  $pkg 安装失败"
     fi
 done
 
-# 3. 硬件流控加速 (智能判断 TurboACC 是否存在)
-log_info "⚡ [阶段 3/6] 配置 RK3588 硬件加速引擎..."
+# ==================== 阶段 3: 硬件加速 ====================
+log_info ""
+log_info "⚡ [3/7] 硬件流量卸载..."
 
-if opkg list-installed | grep -q "luci-app-turboacc"; then
-    log_info "识别到 TurboACC，启用增强模式..."
+if [ -f /etc/config/turboacc ] || opkg list-installed 2>/dev/null | grep -q "turboacc"; then
+    log_info "启用 TurboACC..."
+    if ! uci -q get turboacc.config >/dev/null 2>&1; then
+        uci set turboacc.config=turboacc
+    fi
     uci set turboacc.config.enabled='1'
-    uci set turboacc.config.sfe_flow='1'      # 软件加速
-    uci set turboacc.config.fullcone_nat='1'  # 游戏兼容性 NAT1
-    uci set turboacc.config.bbr_cca='1'       # 确保 BBR 开启
+    uci set turboacc.config.sfe_flow='1' 2>/dev/null || true
+    uci set turboacc.config.fullcone_nat='1' 2>/dev/null || true
+    uci set turboacc.config.bbr_cca='1' 2>/dev/null || true
     uci commit turboacc
-    /etc/init.d/turboacc restart
-    log_info "✅ TurboACC 引擎已激活"
+    /etc/init.d/turboacc restart 2>/dev/null || true
+    log_info "✅ TurboACC 已激活"
 else
-    log_info "未安装 TurboACC，启用原生硬件卸载 (Offloading)..."
-    uci set firewall.@defaults[0].flow_offloading='1'
-    uci set firewall.@defaults[0].flow_offloading_hw='1' # 关键：硬件卸载
-    uci set firewall.@defaults[0].fullcone4='1'
-    uci commit firewall
-    /etc/init.d/firewall restart
-    log_info "✅ 原生硬件流控已激活"
+    log_info "启用原生硬件卸载..."
+    if uci -q get firewall.@defaults[0] >/dev/null 2>&1; then
+        uci set firewall.@defaults[0].flow_offloading='1'
+        uci set firewall.@defaults[0].flow_offloading_hw='1' 2>/dev/null || true
+        
+        # FullCone NAT（代理必需）
+        if uci -q get firewall.@zone[1] >/dev/null 2>&1; then
+            uci set firewall.@zone[1].fullcone4='1' 2>/dev/null || true
+        fi
+        
+        # 安全增强
+        uci set firewall.@defaults[0].drop_invalid='1' 2>/dev/null || true
+        uci set firewall.@defaults[0].syn_flood='1' 2>/dev/null || true
+        
+        uci commit firewall
+        /etc/init.d/firewall restart 2>&1 | grep -v "unknown option" | grep -v "specifies unknown" || true
+        log_info "✅ 硬件卸载已激活"
+    fi
 fi
 
-# 4. 内核参数调优 (覆盖式写入，确保一致性)
-log_info "🛠️ [阶段 4/6] 注入 Linux 内核优化参数..."
+# ==================== 阶段 4: 内核参数（代理优化）====================
+log_info ""
+log_info "🛠️ [4/7] 内核参数优化（代理场景）..."
 backup_file "/etc/sysctl.conf"
 
-# 这里使用 cat > 覆盖写入，防止多次运行脚本导致文件内容重复追加
-cat > /etc/sysctl.conf <<EOF
+cat > /etc/sysctl.conf <<'EOF'
+# ============================================================
+# NanoPC-T6 代理主路由专用内核参数
+# 优化目标: 高并发连接 + 低延迟 + 多核利用
+# ============================================================
+
 # --- BBR 拥塞控制 ---
 net.core.default_qdisc=fq_codel
 net.ipv4.tcp_congestion_control=bbr
 
-# --- 路由转发与连接跟踪 (代理稳定性优化) ---
+# --- 路由转发（必须）---
 net.ipv4.ip_forward=1
-# 连接数上限 (防止 P2P 把路由器跑死)
-net.netfilter.nf_conntrack_max=1048576
-net.netfilter.nf_conntrack_tcp_timeout_established=7440
+net.ipv6.conf.all.forwarding=1
+net.ipv6.conf.default.forwarding=1
+
+# --- 连接跟踪（代理优化：52万连接）---
+net.netfilter.nf_conntrack_max=524288
+net.netfilter.nf_conntrack_buckets=131072
+net.netfilter.nf_conntrack_tcp_timeout_established=7200
 net.netfilter.nf_conntrack_tcp_timeout_time_wait=30
+net.netfilter.nf_conntrack_tcp_timeout_close_wait=15
+net.netfilter.nf_conntrack_tcp_timeout_fin_wait=30
+# UDP 代理关键
+net.netfilter.nf_conntrack_udp_timeout=180
+net.netfilter.nf_conntrack_udp_timeout_stream=300
 
-# --- 2.5G 网卡缓冲区扩容 ---
-net.core.rmem_max=26214400
-net.core.wmem_max=26214400
-net.ipv4.tcp_rmem=4096 87380 26214400
-net.ipv4.tcp_wmem=4096 65536 26214400
-net.core.netdev_max_backlog=10000
+# --- 网络缓冲区（16GB 内存：32MB）---
+net.core.rmem_max=33554432
+net.core.wmem_max=33554432
+net.core.rmem_default=262144
+net.core.wmem_default=262144
+net.ipv4.tcp_rmem=4096 131072 33554432
+net.ipv4.tcp_wmem=4096 131072 33554432
+net.core.netdev_max_backlog=16384
+net.core.somaxconn=8192
 
-# --- 安全加固 ---
-# 开启 SYN Cookies 防范洪水攻击
+# --- TCP 性能优化 ---
+net.ipv4.tcp_fastopen=3
+net.ipv4.tcp_slow_start_after_idle=0
+net.ipv4.tcp_notsent_lowat=16384
+net.ipv4.tcp_window_scaling=1
+net.ipv4.tcp_timestamps=1
+net.ipv4.tcp_sack=1
+net.ipv4.tcp_fack=1
+net.ipv4.tcp_ecn=0
+
+# --- MTU 优化 ---
+net.ipv4.tcp_mtu_probing=1
+
+# --- 安全防护 ---
 net.ipv4.tcp_syncookies=1
-# 开启 TIME-WAIT 重用
+net.ipv4.tcp_syn_retries=2
+net.ipv4.tcp_synack_retries=2
+net.ipv4.tcp_max_syn_backlog=8192
 net.ipv4.tcp_tw_reuse=1
-# 严查反向路径过滤 (防 IP 欺骗)
 net.ipv4.conf.default.rp_filter=1
 net.ipv4.conf.all.rp_filter=1
+net.ipv4.icmp_echo_ignore_broadcasts=1
+net.ipv4.icmp_ignore_bogus_error_responses=1
+
+# --- 文件描述符 ---
+fs.file-max=2097152
+fs.inotify.max_user_instances=8192
+fs.inotify.max_user_watches=524288
+
+# --- 多核网络处理（RPS/RFS）---
+net.core.rps_sock_flow_entries=32768
 EOF
 
-sysctl -p >/dev/null 2>&1
-log_info "✅ 内核参数已重载 (Optimized for 2.5G & Proxy)"
+sysctl -p 2>&1 | grep -v "cannot stat" | grep -v "No such file" || true
+log_info "✅ 内核参数已加载"
 
-# 5. CPU 调度与持久化 (Schedutil 平衡策略)
-log_info "🔋 [阶段 5/6] 部署智能温控与启动项..."
+# ==================== 阶段 5: RPS/RFS（多核优化）====================
+log_info ""
+log_info "🔥 [5/7] 多核网络处理优化..."
+
+# 动态检测 CPU 核心数
+CPU_CORES=$(grep -c ^processor /proc/cpuinfo 2>/dev/null || echo "8")
+log_info "检测到 $CPU_CORES 个 CPU 核心"
+
+# 计算 RPS 掩码（8核心 = ff）
+if [ "$CPU_CORES" -eq 8 ]; then
+    RPS_MASK="ff"
+elif [ "$CPU_CORES" -eq 6 ]; then
+    RPS_MASK="3f"
+elif [ "$CPU_CORES" -eq 4 ]; then
+    RPS_MASK="0f"
+else
+    RPS_MASK="ff"
+fi
+
+cat > /etc/hotplug.d/net/40-rps-rfs <<EOF
+#!/bin/sh
+# RPS/RFS 自动配置
+
+[ "\$ACTION" = "add" ] || exit 0
+
+# 仅处理物理网卡
+case "\$INTERFACE" in
+    eth*|lan*|wan*|enp*)
+        # RPS: 启用所有核心处理接收包
+        for queue in /sys/class/net/\$INTERFACE/queues/rx-*/rps_cpus; do
+            [ -f "\$queue" ] && echo "$RPS_MASK" > \$queue
+        done
+        
+        # RFS: 流感知
+        for queue in /sys/class/net/\$INTERFACE/queues/rx-*/rps_flow_cnt; do
+            [ -f "\$queue" ] && echo "4096" > \$queue
+        done
+        ;;
+esac
+EOF
+
+chmod +x /etc/hotplug.d/net/40-rps-rfs
+
+# 立即应用到现有网卡
+for dev in $(ls /sys/class/net 2>/dev/null | grep -E 'eth|enp|lan|wan'); do
+    for queue in /sys/class/net/$dev/queues/rx-*/rps_cpus; do
+        [ -f "$queue" ] && echo "$RPS_MASK" > $queue 2>/dev/null
+    done
+    for queue in /sys/class/net/$dev/queues/rx-*/rps_flow_cnt; do
+        [ -f "$queue" ] && echo "4096" > $queue 2>/dev/null
+    done
+done
+
+log_info "✅ RPS/RFS 已启用（掩码: $RPS_MASK）"
+
+# ==================== 阶段 6: 启动项优化 ====================
+log_info ""
+log_info "🔋 [6/7] 启动项与 CPU 调度..."
 backup_file "/etc/rc.local"
 
 cat > /etc/rc.local <<EOF
-#!/bin/bash
-# NanoPC-T6 自动优化脚本 (Generated by v17.0)
+#!/bin/sh
+# NanoPC-T6 代理主路由启动脚本 (v19.0)
 
-# 1. 2.5G 网卡队列优化 (txqueuelen)
-for dev in \$(ls /sys/class/net | grep -E 'eth|enp|lan|wan'); do
-    ip link set \$dev txqueuelen $TX_QUEUE_LEN 2>/dev/null
+# 等待系统稳定
+sleep 5
+
+# 1. 网卡队列优化
+for dev in \$(ls /sys/class/net 2>/dev/null | grep -E 'eth|enp|lan|wan'); do
+    [ -d "/sys/class/net/\$dev" ] && ip link set "\$dev" txqueuelen $TX_QUEUE_LEN 2>/dev/null
 done
 
-# 2. CPU 调频策略: $TARGET_GOVERNOR
-# 遍历所有核心，应用 Schedutil 策略 (有负载秒升，无负载秒降)
-for i in \$(seq 0 7); do
-    if [ -d /sys/devices/system/cpu/cpu\$i/cpufreq ]; then
-        echo "$TARGET_GOVERNOR" > /sys/devices/system/cpu/cpu\$i/cpufreq/scaling_governor 2>/dev/null
+# 2. CPU 调频策略（$CPU_CORES 核心）
+for i in \$(seq 0 $((CPU_CORES - 1))); do
+    CPU_PATH="/sys/devices/system/cpu/cpu\$i/cpufreq"
+    if [ -d "\$CPU_PATH" ]; then
+        if grep -q "$CPU_GOVERNOR" "\$CPU_PATH/scaling_available_governors" 2>/dev/null; then
+            echo "$CPU_GOVERNOR" > "\$CPU_PATH/scaling_governor" 2>/dev/null
+        elif grep -q "ondemand" "\$CPU_PATH/scaling_available_governors" 2>/dev/null; then
+            echo "ondemand" > "\$CPU_PATH/scaling_governor" 2>/dev/null
+        fi
     fi
 done
 
-# 3. 确保中断平衡服务运行
-/etc/init.d/irqbalance restart
+# 3. RPS/RFS 应用（热插拔已配置，此处备用）
+for dev in \$(ls /sys/class/net 2>/dev/null | grep -E 'eth|enp|lan|wan'); do
+    for queue in /sys/class/net/\$dev/queues/rx-*/rps_cpus; do
+        [ -f "\$queue" ] && echo "$RPS_MASK" > \$queue 2>/dev/null
+    done
+done
+
+# 4. 确保 irqbalance 运行
+/etc/init.d/irqbalance start 2>/dev/null || true
 
 exit 0
 EOF
 
 chmod +x /etc/rc.local
-/etc/rc.local >/dev/null 2>&1
-log_info "✅ 启动项已重建 | 策略: $TARGET_GOVERNOR"
+/etc/rc.local >/dev/null 2>&1 || log_warn "部分启动项未立即生效（重启后完整生效）"
+log_info "✅ 启动项已配置 | 调频: $CPU_GOVERNOR"
 
-# 6. 中断平衡 (最后保障)
-log_info "⚖️ [阶段 6/6] 锁定 Irqbalance 服务..."
-if ! uci get irqbalance.@irqbalance[0] >/dev/null 2>&1; then
-    uci add irqbalance irqbalance
+# ==================== 阶段 7: irqbalance ====================
+log_info ""
+log_info "⚖️ [7/7] 中断平衡服务..."
+
+if [ ! -f /etc/config/irqbalance ]; then
+    cat > /etc/config/irqbalance <<'EOF'
+config irqbalance
+    option enabled '1'
+    option interval '10'
+EOF
+else
+    if ! uci -q get irqbalance.@irqbalance[0] >/dev/null 2>&1; then
+        uci add irqbalance irqbalance
+    fi
+    uci set irqbalance.@irqbalance[0].enabled='1'
+    uci set irqbalance.@irqbalance[0].interval='10'
+    uci commit irqbalance
 fi
-uci set irqbalance.@irqbalance[0].enabled='1'
-uci set irqbalance.@irqbalance[0].interval='10' # 10秒调整一次，不过度消耗 CPU
-uci commit irqbalance
+
 /etc/init.d/irqbalance enable >/dev/null 2>&1
 /etc/init.d/irqbalance restart >/dev/null 2>&1
 
-# --- 最终验证报告 ---
-log_info "\n================ 部署完成验证 ================"
-
-# 验证 TCP 算法
-TCP_ALG=$(sysctl net.ipv4.tcp_congestion_control | awk '{print $3}')
-if [ "$TCP_ALG" == "bbr" ]; then
-    log_info "✅ 拥塞控制: BBR [已激活]"
+sleep 2
+if pgrep -x irqbalance >/dev/null; then
+    log_info "✅ irqbalance 运行中"
 else
-    log_err "❌ 拥塞控制: $TCP_ALG (异常)"
+    log_warn "⚠️  irqbalance 未运行（重启后生效）"
 fi
 
-# 验证 CPU 策略
-CPU_GOV=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null)
-TEMP=$(($(cat /sys/class/thermal/thermal_zone0/temp) / 1000))
-log_info "✅ 调度策略: $CPU_GOV [智能温控中]"
-log_info "🌡️  当前温度: ${TEMP}°C"
+# ==================== 最终验证 ====================
+log_info ""
+log_info "================ 配置验证 ================"
 
-# 验证网络状态
-if ping -c 1 223.5.5.5 >/dev/null 2>&1; then
-    log_info "✅ 互联网连接: 正常"
+# BBR
+TCP_ALG=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
+if [ "$TCP_ALG" = "bbr" ]; then
+    log_info "✅ BBR: 已启用"
 else
-    log_warn "⚠️ 互联网连接: 异常 (请检查 PPPoE 或 WAN 设置)"
+    log_warn "⚠️  BBR: $TCP_ALG（重启后生效）"
 fi
 
-log_info "================================================"
-log_info "🎉 v17.0 脚本执行完毕！系统已调整至最佳状态。"
-log_info "👉 下一步：请前往 LuCI 安装您的代理软件 (OpenClash/HomeProxy)。"
-log_info "👉 提示：本脚本支持重复运行，配置错误时可随时重跑。"
-log_info "================================================"
+# CPU
+CPU_GOV=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo "unknown")
+log_info "✅ CPU 调频: $CPU_GOV"
+
+# 温度
+if [ -f /sys/class/thermal/thermal_zone0/temp ]; then
+    TEMP=$(($(cat /sys/class/thermal/thermal_zone0/temp) / 1000))
+    log_info "🌡️  温度: ${TEMP}°C"
+fi
+
+# 连接跟踪
+CONNTRACK_MAX=$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo "0")
+CONNTRACK_CUR=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo "0")
+if [ "$CONNTRACK_MAX" -gt 0 ]; then
+    CONNTRACK_PCT=$((CONNTRACK_CUR * 100 / CONNTRACK_MAX))
+    log_info "📊 连接跟踪: $CONNTRACK_CUR / $CONNTRACK_MAX (${CONNTRACK_PCT}%)"
+fi
+
+# RPS 验证
+RPS_STATUS="未知"
+for dev in $(ls /sys/class/net 2>/dev/null | grep -E 'eth|enp' | head -1); do
+    if [ -f /sys/class/net/$dev/queues/rx-0/rps_cpus ]; then
+        RPS_STATUS=$(cat /sys/class/net/$dev/queues/rx-0/rps_cpus)
+        break
+    fi
+done
+log_info "🔥 RPS 状态: $RPS_STATUS (目标: $RPS_MASK)"
+
+# 网络
+if ping -c 1 -W 2 223.5.5.5 >/dev/null 2>&1; then
+    log_info "✅ 网络: 正常"
+else
+    log_warn "⚠️  网络: 异常"
+fi
+
+log_info "==========================================="
+log_info ""
+log_info "🎉 优化完成！NanoPC-T6 已配置为高性能代理主路由。"
+log_info ""
+log_info "📋 配置摘要:"
+log_info "  • 连接跟踪: 52万（代理优化）"
+log_info "  • 网络缓冲: 32MB（16GB 内存优化）"
+log_info "  • 多核处理: RPS/RFS 已启用"
+log_info "  • BBR 加速: 已启用 + 代理参数"
+log_info "  • FullCone NAT: 已启用"
+log_info ""
+log_info "🔧 下一步操作:"
+log_info "  1. 【重要】重启系统: reboot"
+log_info "  2. 安装代理软件:"
+log_info "     - OpenClash: opkg install luci-app-openclash"
+log_info "     - HomeProxy: opkg install luci-app-homeproxy"
+log_info "     - PassWall: opkg install luci-app-passwall"
+log_info "  3. 验证优化效果:"
+log_info "     sysctl net.ipv4.tcp_congestion_control"
+log_info "     cat /proc/sys/net/netfilter/nf_conntrack_max"
+log_info "     cat /sys/class/net/eth0/queues/rx-0/rps_cpus"
+log_info ""
+log_info "📁 备份位置: $BACKUP_DIR"
+log_info "📋 详细日志: $LOG_FILE"
+log_info ""
+log_info "⚠️  提示:"
+log_info "  • 本脚本已为代理场景优化，无需额外调整"
+log_info "  • 如需恢复: cp -r $BACKUP_DIR/* /etc/ && reboot"
+log_info "  • 支持重复运行，配置错误时可重新执行"
+log_info "==========================================="
