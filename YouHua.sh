@@ -50,9 +50,10 @@ log_info "🚀 NanoPC-T6 代理主路由优化 v19.0"
 DEVICE_MODEL=$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo 'RK3588 Device')
 log_info "设备: $DEVICE_MODEL"
 
-# 检测内存
-TOTAL_MEM=$(free -m | awk 'NR==2 {print $2}')
-log_info "内存: ${TOTAL_MEM}MB"
+# 检测内存（修正单位）
+TOTAL_MEM_KB=$(free | awk 'NR==2 {print $2}')
+TOTAL_MEM_MB=$((TOTAL_MEM_KB / 1024))
+log_info "内存: ${TOTAL_MEM_MB}MB"
 
 [ "$(id -u)" -eq 0 ] || log_err "需要 root 权限"
 check_network
@@ -245,7 +246,7 @@ log_info "🔥 [5/7] 多核网络处理优化..."
 CPU_CORES=$(grep -c ^processor /proc/cpuinfo 2>/dev/null || echo "8")
 log_info "检测到 $CPU_CORES 个 CPU 核心"
 
-# 计算 RPS 掩码（8核心 = ff）
+# 计算 RPS 掩码
 if [ "$CPU_CORES" -eq 8 ]; then
     RPS_MASK="ff"
 elif [ "$CPU_CORES" -eq 6 ]; then
@@ -256,7 +257,31 @@ else
     RPS_MASK="ff"
 fi
 
-cat > /etc/hotplug.d/net/40-rps-rfs <<EOF
+# 检测物理网卡
+PHYSICAL_NICS=$(ls /sys/class/net 2>/dev/null | grep -E '^(eth|enp|wan|lan)[0-9]' | head -5)
+
+if [ -z "$PHYSICAL_NICS" ]; then
+    log_warn "未检测到物理网卡，跳过 RPS/RFS 配置"
+else
+    log_info "检测到物理网卡: $(echo $PHYSICAL_NICS | tr '\n' ' ')"
+    
+    # 检查是否支持 RPS
+    RPS_SUPPORTED=0
+    for nic in $PHYSICAL_NICS; do
+        if [ -d /sys/class/net/$nic/queues ]; then
+            RPS_QUEUE=$(ls -d /sys/class/net/$nic/queues/rx-* 2>/dev/null | head -1)
+            if [ -n "$RPS_QUEUE" ] && [ -f "$RPS_QUEUE/rps_cpus" ]; then
+                RPS_SUPPORTED=1
+                break
+            fi
+        fi
+    done
+    
+    if [ "$RPS_SUPPORTED" -eq 0 ]; then
+        log_warn "网卡不支持 RPS（可能已被驱动处理或单队列网卡）"
+    else
+        # 创建热插拔脚本
+        cat > /etc/hotplug.d/net/40-rps-rfs <<EOF
 #!/bin/sh
 # RPS/RFS 自动配置
 
@@ -267,30 +292,44 @@ case "\$INTERFACE" in
     eth*|lan*|wan*|enp*)
         # RPS: 启用所有核心处理接收包
         for queue in /sys/class/net/\$INTERFACE/queues/rx-*/rps_cpus; do
-            [ -f "\$queue" ] && echo "$RPS_MASK" > \$queue
+            [ -f "\$queue" ] && echo "$RPS_MASK" > \$queue 2>/dev/null
         done
         
         # RFS: 流感知
         for queue in /sys/class/net/\$INTERFACE/queues/rx-*/rps_flow_cnt; do
-            [ -f "\$queue" ] && echo "4096" > \$queue
+            [ -f "\$queue" ] && echo "4096" > \$queue 2>/dev/null
         done
+        
+        logger -t rps-rfs "Applied RPS/RFS to \$INTERFACE"
         ;;
 esac
 EOF
-
-chmod +x /etc/hotplug.d/net/40-rps-rfs
-
-# 立即应用到现有网卡
-for dev in $(ls /sys/class/net 2>/dev/null | grep -E 'eth|enp|lan|wan'); do
-    for queue in /sys/class/net/$dev/queues/rx-*/rps_cpus; do
-        [ -f "$queue" ] && echo "$RPS_MASK" > $queue 2>/dev/null
-    done
-    for queue in /sys/class/net/$dev/queues/rx-*/rps_flow_cnt; do
-        [ -f "$queue" ] && echo "4096" > $queue 2>/dev/null
-    done
-done
-
-log_info "✅ RPS/RFS 已启用（掩码: $RPS_MASK）"
+        chmod +x /etc/hotplug.d/net/40-rps-rfs
+        
+        # 立即应用到现有网卡
+        RPS_APPLIED=0
+        for nic in $PHYSICAL_NICS; do
+            if [ -d /sys/class/net/$nic/queues ]; then
+                for queue in /sys/class/net/$nic/queues/rx-*/rps_cpus; do
+                    if [ -f "$queue" ]; then
+                        echo "$RPS_MASK" > $queue 2>/dev/null && RPS_APPLIED=1
+                    fi
+                done
+                for queue in /sys/class/net/$nic/queues/rx-*/rps_flow_cnt; do
+                    if [ -f "$queue" ]; then
+                        echo "4096" > $queue 2>/dev/null
+                    fi
+                done
+            fi
+        done
+        
+        if [ "$RPS_APPLIED" -eq 1 ]; then
+            log_info "✅ RPS/RFS 已启用（掩码: $RPS_MASK）"
+        else
+            log_warn "⚠️  RPS/RFS 配置失败（网卡可能不支持）"
+        fi
+    fi
+fi
 
 # ==================== 阶段 6: 启动项优化 ====================
 log_info ""
@@ -397,15 +436,21 @@ if [ "$CONNTRACK_MAX" -gt 0 ]; then
     log_info "📊 连接跟踪: $CONNTRACK_CUR / $CONNTRACK_MAX (${CONNTRACK_PCT}%)"
 fi
 
-# RPS 验证
-RPS_STATUS="未知"
-for dev in $(ls /sys/class/net 2>/dev/null | grep -E 'eth|enp' | head -1); do
-    if [ -f /sys/class/net/$dev/queues/rx-0/rps_cpus ]; then
-        RPS_STATUS=$(cat /sys/class/net/$dev/queues/rx-0/rps_cpus)
+# RPS 验证（动态检测网卡）
+RPS_STATUS="未配置"
+for nic in $(ls /sys/class/net 2>/dev/null | grep -E '^(eth|enp|wan|lan)[0-9]' | head -1); do
+    RPS_FILE="/sys/class/net/$nic/queues/rx-0/rps_cpus"
+    if [ -f "$RPS_FILE" ]; then
+        RPS_STATUS="$(cat $RPS_FILE 2>/dev/null) (网卡: $nic)"
         break
     fi
 done
-log_info "🔥 RPS 状态: $RPS_STATUS (目标: $RPS_MASK)"
+
+if [ "$RPS_STATUS" = "未配置" ]; then
+    log_warn "⚠️  RPS: 网卡不支持或已被驱动优化"
+else
+    log_info "🔥 RPS 状态: $RPS_STATUS (目标: $RPS_MASK)"
+fi
 
 # 网络
 if ping -c 1 -W 2 223.5.5.5 >/dev/null 2>&1; then
@@ -434,7 +479,8 @@ log_info "     - PassWall: opkg install luci-app-passwall"
 log_info "  3. 验证优化效果:"
 log_info "     sysctl net.ipv4.tcp_congestion_control"
 log_info "     cat /proc/sys/net/netfilter/nf_conntrack_max"
-log_info "     cat /sys/class/net/eth0/queues/rx-0/rps_cpus"
+log_info "     ls /sys/class/net/  # 查看网卡名称"
+log_info "     cat /sys/class/net/\$(ls /sys/class/net/ | grep -E '^eth|^enp' | head -1)/queues/rx-0/rps_cpus 2>/dev/null || echo '网卡不支持RPS'"
 log_info ""
 log_info "📁 备份位置: $BACKUP_DIR"
 log_info "📋 详细日志: $LOG_FILE"
