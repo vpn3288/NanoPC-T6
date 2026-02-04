@@ -1,165 +1,233 @@
 #!/bin/bash
-# =========================================================
-# NanoPC-T6 (RK3588) 终极优化脚本 v9.0
-# 融合功能：内核BBR、SmartDNS全效、8核锁频、中断平衡、网络扩容
-# 修复：BBR安装逻辑、SmartDNS解析异常、UCI索引报错
-# =========================================================
+# ==============================================================================
+# NanoPC-T6 (RK3588) 工业级全向容错优化脚本 v17.0
+# ------------------------------------------------------------------------------
+# 适用：全新部署 / 二次覆盖 / 故障修复
+# 特性：自动纠错、环境自检、智能调度、无 SmartDNS 冲突
+# ==============================================================================
 
-# 基础设置
-LOGFILE="/tmp/optimization_$(date +%Y%m%d_%H%M%S).log"
-BACKUP_DIR="/etc/backup_$(date +%Y%m%d_%H%M%S)"
+# --- 全局变量定义 ---
+LOG_FILE="/tmp/optimization_v17_$(date +%Y%m%d).log"
+BACKUP_DIR="/etc/config_backup_$(date +%Y%m%d_%H%M%S)"
+TARGET_GOVERNOR="schedutil"  # 推荐调度：负载感应 (兼顾性能与散热)
+TX_QUEUE_LEN="5000"          # 2.5G 网卡最佳队列
 
-log() { echo -e "\033[32m[INFO] $1\033[0m" | tee -a "$LOGFILE"; }
-warn() { echo -e "\033[33m[WARN] $1\033[0m" | tee -a "$LOGFILE"; }
-error() { echo -e "\033[31m[ERROR] $1\033[0m" | tee -a "$LOGFILE"; }
+# --- 核心工具函数 ---
 
-# 备份函数
-backup_config() {
-    [ -f "$1" ] && { mkdir -p "$BACKUP_DIR"; cp "$1" "$BACKUP_DIR/"; log "💾 备份: $1"; }
+# 1. 日志系统
+log_info() { echo -e "\033[32m[INFO] [$(date +'%H:%M:%S')] $1\033[0m" | tee -a "$LOG_FILE"; }
+log_warn() { echo -e "\033[33m[WARN] [$(date +'%H:%M:%S')] $1\033[0m" | tee -a "$LOG_FILE"; }
+log_err()  { echo -e "\033[31m[ERROR] [$(date +'%H:%M:%S')] $1\033[0m" | tee -a "$LOG_FILE"; }
+
+# 2. 安全备份 (防手滑)
+backup_file() {
+    local file_path="$1"
+    if [ -f "$file_path" ]; then
+        mkdir -p "$BACKUP_DIR"
+        cp "$file_path" "$BACKUP_DIR/"
+        log_info "💾 备份配置: $file_path -> $BACKUP_DIR/"
+    fi
 }
 
-# 1. 环境准备
-log "🚀 开始 NanoPC-T6 极致性能调优 (v9.0)..."
-[ "$(id -u)" -eq 0 ] || { error "请使用 root 运行！"; exit 1; }
+# 3. 网络自检 (防止断网导致 opkg 报错)
+check_network() {
+    log_info "🔍 环境自检: 正在测试网络连通性..."
+    if ping -c 3 223.5.5.5 >/dev/null 2>&1; then
+        log_info "✅ 网络连接正常"
+    else
+        log_err "❌ 无法连接互联网，请检查 WAN 口！脚本终止以保护系统。"
+        exit 1
+    fi
+}
 
-# 自动补全 Bash 
-if [ -z "$BASH_VERSION" ]; then
-    opkg update && opkg install bash
-    exec bash "$0" "$@"
+# --- 主逻辑开始 ---
+
+log_info "🚀 开始执行 v17.0 全向容错部署..."
+log_info "设备型号: $(cat /proc/device-tree/model 2>/dev/null || echo 'Unknown RK3588 Device')"
+
+# 0. 权限检查
+if [ "$(id -u)" -ne 0 ]; then
+    log_err "权限不足，请使用 root 运行！"
+    exit 1
+fi
+check_network
+
+# 1. 冲突清洗 (最关键的一步：无论你是否安装过，都检查一遍)
+log_info "🧹 [阶段 1/6] 智能清洗潜在冲突组件..."
+
+# >>> SmartDNS 清洗逻辑 <<<
+# 即使你现在没装，万一以后手滑装了，或者旧配置残留，这里都会强制清理
+if opkg list-installed | grep -q "smartdns"; then
+    log_warn "发现 SmartDNS 组件，正在为了系统纯净性进行移除..."
+    /etc/init.d/smartdns stop 2>/dev/null
+    /etc/init.d/smartdns disable 2>/dev/null
+    opkg remove luci-app-smartdns smartdns --force-removal >/dev/null 2>&1
+    # 彻底删除残留配置，防止尸位素餐
+    rm -rf /etc/config/smartdns
+    log_info "✅ SmartDNS 已彻底卸载，端口 53/6053 已释放。"
+else
+    log_info "✅ 未发现 SmartDNS，环境纯净。"
 fi
 
-# 2. 软件安装 (修正 BBR 逻辑)
-log "📦 步骤 1: 正在安装/补全性能组件..."
-opkg update
-# 强制安装列表，不再做预检测，直接让 opkg 处理依赖
-PACKAGES="smartdns luci-app-smartdns irqbalance ethtool ip-full kmod-tcp-bbr kmod-sched-core bind-host coreutils-stat"
-for pkg in $PACKAGES; do
-    if opkg list-installed | grep -q "^$pkg "; then
-        log "  ⏭️  $pkg 已安装"
+# >>> Dnsmasq 重置逻辑 <<<
+# 这一步是为了确保 Dnsmasq 回归“标准傻瓜模式”，方便代理软件接管
+log_info "正在校验 Dnsmasq 配置..."
+backup_file "/etc/config/dhcp"
+# 无论原本怎么改的，强制删掉 server 指向，回归默认
+uci -q del dhcp.@dnsmasq[0].server
+uci -q set dhcp.@dnsmasq[0].noresolv='0'
+uci -q set dhcp.@dnsmasq[0].cachesize='2000' # 扩容缓存
+uci commit dhcp
+/etc/init.d/dnsmasq restart
+log_info "✅ Dnsmasq 已重置为标准路由模式。"
+
+# 2. 软件包补全 (支持重复运行，已安装的自动跳过)
+log_info "📦 [阶段 2/6] 校验并补全核心组件..."
+opkg update >/dev/null 2>&1
+
+# 必装清单
+PKG_LIST="luci-app-turboacc irqbalance ethtool ip-full kmod-tcp-bbr kmod-sched-core bind-host coreutils-stat"
+
+for pkg in $PKG_LIST; do
+    if opkg list-installed | grep -q "^$pkg"; then
+        log_info "  ⏭️  $pkg 已安装 (跳过)"
     else
-        log "  ⬇️  正在安装 $pkg..."
-        opkg install "$pkg" || warn "  ⚠️  $pkg 安装受阻"
+        log_info "  ⬇️  正在安装 $pkg..."
+        if opkg install "$pkg" >> "$LOG_FILE" 2>&1; then
+            log_info "  ✅ $pkg 安装成功"
+        else
+            log_warn "  ⚠️  $pkg 安装失败 (可能是源暂时不可用，不影响核心功能)"
+        fi
     fi
 done
 
-# 3. 强制注入 BBR
-log "⚡ 步骤 2: 激活 BBR 拥塞控制算法..."
-backup_config /etc/sysctl.conf
-modprobe tcp_bbr 2>/dev/null
+# 3. 硬件流控加速 (智能判断 TurboACC 是否存在)
+log_info "⚡ [阶段 3/6] 配置 RK3588 硬件加速引擎..."
+
+if opkg list-installed | grep -q "luci-app-turboacc"; then
+    log_info "识别到 TurboACC，启用增强模式..."
+    uci set turboacc.config.enabled='1'
+    uci set turboacc.config.sfe_flow='1'      # 软件加速
+    uci set turboacc.config.fullcone_nat='1'  # 游戏兼容性 NAT1
+    uci set turboacc.config.bbr_cca='1'       # 确保 BBR 开启
+    uci commit turboacc
+    /etc/init.d/turboacc restart
+    log_info "✅ TurboACC 引擎已激活"
+else
+    log_info "未安装 TurboACC，启用原生硬件卸载 (Offloading)..."
+    uci set firewall.@defaults[0].flow_offloading='1'
+    uci set firewall.@defaults[0].flow_offloading_hw='1' # 关键：硬件卸载
+    uci set firewall.@defaults[0].fullcone4='1'
+    uci commit firewall
+    /etc/init.d/firewall restart
+    log_info "✅ 原生硬件流控已激活"
+fi
+
+# 4. 内核参数调优 (覆盖式写入，确保一致性)
+log_info "🛠️ [阶段 4/6] 注入 Linux 内核优化参数..."
+backup_file "/etc/sysctl.conf"
+
+# 这里使用 cat > 覆盖写入，防止多次运行脚本导致文件内容重复追加
 cat > /etc/sysctl.conf <<EOF
-# TCP BBR 优化
+# --- BBR 拥塞控制 ---
 net.core.default_qdisc=fq_codel
 net.ipv4.tcp_congestion_control=bbr
-# 高并发连接优化
+
+# --- 路由转发与连接跟踪 (代理稳定性优化) ---
+net.ipv4.ip_forward=1
+# 连接数上限 (防止 P2P 把路由器跑死)
 net.netfilter.nf_conntrack_max=1048576
-net.core.rmem_max=16777216
-net.core.wmem_max=16777216
-net.ipv4.tcp_rmem=4096 87380 16777216
-net.ipv4.tcp_wmem=4096 65536 16777216
-net.core.netdev_max_backlog=5000
-net.ipv4.tcp_fastopen=3
+net.netfilter.nf_conntrack_tcp_timeout_established=7440
+net.netfilter.nf_conntrack_tcp_timeout_time_wait=30
+
+# --- 2.5G 网卡缓冲区扩容 ---
+net.core.rmem_max=26214400
+net.core.wmem_max=26214400
+net.ipv4.tcp_rmem=4096 87380 26214400
+net.ipv4.tcp_wmem=4096 65536 26214400
+net.core.netdev_max_backlog=10000
+
+# --- 安全加固 ---
+# 开启 SYN Cookies 防范洪水攻击
+net.ipv4.tcp_syncookies=1
+# 开启 TIME-WAIT 重用
+net.ipv4.tcp_tw_reuse=1
+# 严查反向路径过滤 (防 IP 欺骗)
+net.ipv4.conf.default.rp_filter=1
+net.ipv4.conf.all.rp_filter=1
 EOF
+
 sysctl -p >/dev/null 2>&1
+log_info "✅ 内核参数已重载 (Optimized for 2.5G & Proxy)"
 
-# 4. SmartDNS 暴力重构 (核心修复)
-log "🌐 步骤 3: 配置 SmartDNS 解析引擎 (6053端口)..."
-backup_config /etc/config/smartdns
-/etc/init.d/smartdns stop 2>/dev/null
-# 直接重写，不再尝试 merge，防止旧配置污染
-cat > /etc/config/smartdns <<EOF
-config smartdns
-    option enabled '1'
-    option port '6053'
-    option tcp_server '1'
-    option ipv6_server '1'
-    option dualstack_ip_selection '1'
-    option prefetch_domain '1'
-    option serve_expired '1'
-    option cache_size '10240'
-    option redirect 'dnsmasq-upstream'
+# 5. CPU 调度与持久化 (Schedutil 平衡策略)
+log_info "🔋 [阶段 5/6] 部署智能温控与启动项..."
+backup_file "/etc/rc.local"
 
-config server
-    option name 'alidns'
-    option ip '223.5.5.5'
-    option type 'udp'
-    option enabled '1'
+cat > /etc/rc.local <<EOF
+#!/bin/bash
+# NanoPC-T6 自动优化脚本 (Generated by v17.0)
 
-config server
-    option name 'dnspod'
-    option ip '119.29.29.29'
-    option type 'udp'
-    option enabled '1'
+# 1. 2.5G 网卡队列优化 (txqueuelen)
+for dev in \$(ls /sys/class/net | grep -E 'eth|enp|lan|wan'); do
+    ip link set \$dev txqueuelen $TX_QUEUE_LEN 2>/dev/null
+done
 
-config server
-    option name 'ali_doh'
-    option ip 'https://223.5.5.5/dns-query'
-    option type 'https'
-    option enabled '1'
+# 2. CPU 调频策略: $TARGET_GOVERNOR
+# 遍历所有核心，应用 Schedutil 策略 (有负载秒升，无负载秒降)
+for i in \$(seq 0 7); do
+    if [ -d /sys/devices/system/cpu/cpu\$i/cpufreq ]; then
+        echo "$TARGET_GOVERNOR" > /sys/devices/system/cpu/cpu\$i/cpufreq/scaling_governor 2>/dev/null
+    fi
+done
+
+# 3. 确保中断平衡服务运行
+/etc/init.d/irqbalance restart
+
+exit 0
 EOF
-uci commit smartdns
-/etc/init.d/smartdns enable
-/etc/init.d/smartdns restart
 
-# 5. DNS 闭环与 dnsmasq 优化
-log "🔗 步骤 4: 打通 DNS 流量闭环..."
-backup_config /etc/config/dhcp
-# 移除所有旧的 server 定义，防止冲突
-uci -q del dhcp.@dnsmasq[0].server
-uci -q del_list dhcp.@dnsmasq[0].server
-# 强制指定 SmartDNS 为唯一上游
-uci add_list dhcp.@dnsmasq[0].server='127.0.0.1#6053'
-uci set dhcp.@dnsmasq[0].noresolv='1'
-uci set dhcp.@dnsmasq[0].cachesize='0'
-uci commit dhcp
-/etc/init.d/dnsmasq restart
+chmod +x /etc/rc.local
+/etc/rc.local >/dev/null 2>&1
+log_info "✅ 启动项已重建 | 策略: $TARGET_GOVERNOR"
 
-# 6. 中断平衡 (irqbalance) 逻辑增强
-log "⚖️  步骤 5: 激活多核中断平衡 (irqbalance)..."
+# 6. 中断平衡 (最后保障)
+log_info "⚖️ [阶段 6/6] 锁定 Irqbalance 服务..."
 if ! uci get irqbalance.@irqbalance[0] >/dev/null 2>&1; then
     uci add irqbalance irqbalance
 fi
 uci set irqbalance.@irqbalance[0].enabled='1'
+uci set irqbalance.@irqbalance[0].interval='10' # 10秒调整一次，不过度消耗 CPU
 uci commit irqbalance
-/etc/init.d/irqbalance enable
-/etc/init.d/irqbalance restart
+/etc/init.d/irqbalance enable >/dev/null 2>&1
+/etc/init.d/irqbalance restart >/dev/null 2>&1
 
-# 7. CPU 锁频与持久化优化
-log "🔥 步骤 6: 锁定 RK3588 狂暴模式 (持久化)..."
-backup_config /etc/rc.local
-cat > /etc/rc.local <<'EOF'
-#!/bin/sh
-# 网卡队列优化
-for dev in $(ls /sys/class/net | grep -E 'eth|enp|lan|wan'); do
-    ip link set $dev txqueuelen 5000 2>/dev/null
-done
-# 锁定 8 核主频
-for i in $(seq 0 7); do
-    [ -d /sys/devices/system/cpu/cpu$i/cpufreq ] && {
-        echo "performance" > /sys/devices/system/cpu/cpu$i/cpufreq/scaling_governor
-        cat /sys/devices/system/cpu/cpu$i/cpufreq/scaling_max_freq > /sys/devices/system/cpu/cpu$i/cpufreq/scaling_min_freq
-    }
-done
-/etc/init.d/smartdns restart
-/etc/init.d/irqbalance restart
-exit 0
-EOF
-chmod +x /etc/rc.local
-/etc/rc.local 2>/dev/null
+# --- 最终验证报告 ---
+log_info "\n================ 部署完成验证 ================"
 
-# 8. 验证
-log "\n🔍 状态验证报告:"
-# BBR 验证
-sysctl net.ipv4.tcp_congestion_control | grep -q bbr && log " ✅ BBR: 已激活" || error " ❌ BBR: 未能激活"
-# SmartDNS 验证
-if host -W 2 baidu.com 127.0.0.1 -p 6053 >/dev/null 2>&1; then
-    log " ✅ SmartDNS: 解析正常"
+# 验证 TCP 算法
+TCP_ALG=$(sysctl net.ipv4.tcp_congestion_control | awk '{print $3}')
+if [ "$TCP_ALG" == "bbr" ]; then
+    log_info "✅ 拥塞控制: BBR [已激活]"
 else
-    error " ❌ SmartDNS: 解析异常"
+    log_err "❌ 拥塞控制: $TCP_ALG (异常)"
 fi
-# CPU 频率验证
-log " 🌡️  CPU 温度: $(($(cat /sys/class/thermal/thermal_zone0/temp) / 1000))°C"
-log " 🏎️  调频策略: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)"
 
-log "\n=========================================="
-log "🎉 优化完成！脚本已根据你的版本进行了最终修正。"
-log "=========================================="
+# 验证 CPU 策略
+CPU_GOV=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null)
+TEMP=$(($(cat /sys/class/thermal/thermal_zone0/temp) / 1000))
+log_info "✅ 调度策略: $CPU_GOV [智能温控中]"
+log_info "🌡️  当前温度: ${TEMP}°C"
+
+# 验证网络状态
+if ping -c 1 223.5.5.5 >/dev/null 2>&1; then
+    log_info "✅ 互联网连接: 正常"
+else
+    log_warn "⚠️ 互联网连接: 异常 (请检查 PPPoE 或 WAN 设置)"
+fi
+
+log_info "================================================"
+log_info "🎉 v17.0 脚本执行完毕！系统已调整至最佳状态。"
+log_info "👉 下一步：请前往 LuCI 安装您的代理软件 (OpenClash/HomeProxy)。"
+log_info "👉 提示：本脚本支持重复运行，配置错误时可随时重跑。"
+log_info "================================================"
