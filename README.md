@@ -45,8 +45,10 @@
 
 ## 🚀 快速开始
 
+### 更新软件包
+```bash
 opkg upgrade luci-app-openclash
-
+```
 ### 一键执行
 ```bash
 wget -qO- https://raw.githubusercontent.com/vpn3288/NanoPC-T6/main/YouHua.sh | bash
