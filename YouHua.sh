@@ -1,19 +1,19 @@
 #!/bin/bash
 # ==============================================================================
-# NanoPC-T6 (16GB) 代理主路由专用优化脚本 v20.0
+# NanoPC-T6 (16GB) 代理主路由优化脚本 v21.0 (精简版)
 # ------------------------------------------------------------------------------
 # 硬件: RK3588 8核心 / 16GB 内存 / 64GB 存储 / 2x 2.5G 网口
 # 场景: 主路由 + 代理软件（OpenClash/HomeProxy/PassWall）
-# 特性: 高并发连接、低延迟、多核优化、代理友好
-# v20.0 更新: 禁用 irqbalance，使用 RPS（多队列网卡优化）
+# 特性: 核心优化、无冲突、简洁高效
+# v21.0: 移除 irqbalance 和 RPS（网卡驱动已优化）
 # ==============================================================================
 
 set -e
 
 # --- 全局变量 ---
-LOG_FILE="/tmp/optimization_v20_$(date +%Y%m%d).log"
+LOG_FILE="/tmp/optimization_v21_$(date +%Y%m%d).log"
 BACKUP_DIR="/etc/config_backup_$(date +%Y%m%d_%H%M%S)"
-CPU_GOVERNOR="schedutil"  # 负载感应（推荐）或 performance（极致性能）
+CPU_GOVERNOR="schedutil"
 TX_QUEUE_LEN="5000"
 
 # --- 日志函数 ---
@@ -46,12 +46,11 @@ uci_delete_all() {
 }
 
 # --- 主流程 ---
-log_info "🚀 NanoPC-T6 代理主路由优化 v20.0"
+log_info "🚀 NanoPC-T6 代理主路由优化 v21.0 (精简版)"
 
 DEVICE_MODEL=$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo 'RK3588 Device')
 log_info "设备: $DEVICE_MODEL"
 
-# 检测内存（修正单位）
 TOTAL_MEM_KB=$(free | awk 'NR==2 {print $2}')
 TOTAL_MEM_MB=$((TOTAL_MEM_KB / 1024))
 log_info "内存: ${TOTAL_MEM_MB}MB"
@@ -61,11 +60,11 @@ check_network
 
 # ==================== 阶段 1: 环境清理 ====================
 log_info ""
-log_info "🧹 [1/7] 环境清理..."
+log_info "🧹 [1/6] 环境清理..."
 
-# SmartDNS 清理（代理软件需要接管 DNS）
+# SmartDNS 清理
 if opkg list-installed 2>/dev/null | grep -q "smartdns"; then
-    log_warn "检测到 SmartDNS，正在移除（避免与代理冲突）..."
+    log_warn "检测到 SmartDNS，正在移除..."
     /etc/init.d/smartdns stop 2>/dev/null || true
     /etc/init.d/smartdns disable 2>/dev/null || true
     opkg remove luci-app-smartdns smartdns --force-removal-of-dependent-packages >/dev/null 2>&1 || true
@@ -75,17 +74,16 @@ else
     log_info "✅ 环境纯净"
 fi
 
-# Dnsmasq 重置（为代理软件准备）
+# Dnsmasq 重置
 log_info "重置 dnsmasq 配置..."
 backup_file "/etc/config/dhcp"
 
 uci_delete_all "dhcp.@dnsmasq[0].server"
 uci set dhcp.@dnsmasq[0].noresolv='0'
-uci set dhcp.@dnsmasq[0].cachesize='5000'  # 代理场景：适中缓存
-uci set dhcp.@dnsmasq[0].min_cache_ttl='600'  # 10分钟
+uci set dhcp.@dnsmasq[0].cachesize='5000'
+uci set dhcp.@dnsmasq[0].min_cache_ttl='600'
 uci commit dhcp
 
-# 安全重启 dnsmasq
 /etc/init.d/dnsmasq restart &
 DNSMASQ_PID=$!
 count=0
@@ -107,14 +105,15 @@ if kill -0 $DNSMASQ_PID 2>/dev/null; then
 fi
 
 sleep 2
-log_info "✅ dnsmasq 已重置为代理兼容模式"
+log_info "✅ dnsmasq 已重置"
 
-# ==================== 阶段 2: 软件包安装 ====================
+# ==================== 阶段 2: 核心组件安装 ====================
 log_info ""
-log_info "📦 [2/7] 核心组件安装..."
+log_info "📦 [2/6] 核心组件安装..."
 opkg update >/dev/null 2>&1 || log_warn "软件源更新失败"
 
-PKG_LIST="irqbalance ethtool ip-full kmod-tcp-bbr kmod-sched-core bind-host coreutils-stat"
+# 只安装必要的包（不包含 irqbalance）
+PKG_LIST="ethtool ip-full kmod-tcp-bbr kmod-sched-core bind-host coreutils-stat"
 
 for pkg in $PKG_LIST; do
     if opkg list-installed 2>/dev/null | grep -q "^$pkg "; then
@@ -127,7 +126,7 @@ done
 
 # ==================== 阶段 3: 硬件加速 ====================
 log_info ""
-log_info "⚡ [3/7] 硬件流量卸载..."
+log_info "⚡ [3/6] 硬件流量卸载..."
 
 if [ -f /etc/config/turboacc ] || opkg list-installed 2>/dev/null | grep -q "turboacc"; then
     log_info "启用 TurboACC..."
@@ -147,12 +146,10 @@ else
         uci set firewall.@defaults[0].flow_offloading='1'
         uci set firewall.@defaults[0].flow_offloading_hw='1' 2>/dev/null || true
         
-        # FullCone NAT（代理必需）
         if uci -q get firewall.@zone[1] >/dev/null 2>&1; then
             uci set firewall.@zone[1].fullcone4='1' 2>/dev/null || true
         fi
         
-        # 安全增强
         uci set firewall.@defaults[0].drop_invalid='1' 2>/dev/null || true
         uci set firewall.@defaults[0].syn_flood='1' 2>/dev/null || true
         
@@ -162,22 +159,22 @@ else
     fi
 fi
 
-# ==================== 阶段 4: 内核参数（代理优化）====================
+# ==================== 阶段 4: 内核参数优化 ====================
 log_info ""
-log_info "🛠️ [4/7] 内核参数优化（代理场景）..."
+log_info "🛠️ [4/6] 内核参数优化（代理场景）..."
 backup_file "/etc/sysctl.conf"
 
 cat > /etc/sysctl.conf <<'EOF'
 # ============================================================
-# NanoPC-T6 代理主路由专用内核参数
-# 优化目标: 高并发连接 + 低延迟 + 多核利用
+# NanoPC-T6 代理主路由专用内核参数 v21.0
+# 优化目标: 高并发连接 + 低延迟 + 代理友好
 # ============================================================
 
 # --- BBR 拥塞控制 ---
 net.core.default_qdisc=fq_codel
 net.ipv4.tcp_congestion_control=bbr
 
-# --- 路由转发（必须）---
+# --- 路由转发 ---
 net.ipv4.ip_forward=1
 net.ipv6.conf.all.forwarding=1
 net.ipv6.conf.default.forwarding=1
@@ -189,7 +186,6 @@ net.netfilter.nf_conntrack_tcp_timeout_established=7200
 net.netfilter.nf_conntrack_tcp_timeout_time_wait=30
 net.netfilter.nf_conntrack_tcp_timeout_close_wait=15
 net.netfilter.nf_conntrack_tcp_timeout_fin_wait=30
-# UDP 代理关键
 net.netfilter.nf_conntrack_udp_timeout=180
 net.netfilter.nf_conntrack_udp_timeout_stream=300
 
@@ -212,8 +208,6 @@ net.ipv4.tcp_timestamps=1
 net.ipv4.tcp_sack=1
 net.ipv4.tcp_fack=1
 net.ipv4.tcp_ecn=0
-
-# --- MTU 优化 ---
 net.ipv4.tcp_mtu_probing=1
 
 # --- 安全防护 ---
@@ -231,115 +225,23 @@ net.ipv4.icmp_ignore_bogus_error_responses=1
 fs.file-max=2097152
 fs.inotify.max_user_instances=8192
 fs.inotify.max_user_watches=524288
-
-# --- 多核网络处理（RPS/RFS）---
-net.core.rps_sock_flow_entries=32768
 EOF
 
 sysctl -p 2>&1 | grep -v "cannot stat" | grep -v "No such file" || true
 log_info "✅ 内核参数已加载"
 
-# ==================== 阶段 5: RPS/RFS（多核优化）====================
+# ==================== 阶段 5: CPU 调度 ====================
 log_info ""
-log_info "🔥 [5/7] 多核网络处理优化..."
+log_info "🔋 [5/6] CPU 调度与网卡队列..."
 
-# 动态检测 CPU 核心数
 CPU_CORES=$(grep -c ^processor /proc/cpuinfo 2>/dev/null || echo "8")
 log_info "检测到 $CPU_CORES 个 CPU 核心"
 
-# 计算 RPS 掩码
-if [ "$CPU_CORES" -eq 8 ]; then
-    RPS_MASK="ff"
-elif [ "$CPU_CORES" -eq 6 ]; then
-    RPS_MASK="3f"
-elif [ "$CPU_CORES" -eq 4 ]; then
-    RPS_MASK="0f"
-else
-    RPS_MASK="ff"
-fi
-
-# 检测物理网卡
-PHYSICAL_NICS=$(ls /sys/class/net 2>/dev/null | grep -E '^(eth|enp|wan|lan)[0-9]' | head -5)
-
-if [ -z "$PHYSICAL_NICS" ]; then
-    log_warn "未检测到物理网卡，跳过 RPS/RFS 配置"
-else
-    log_info "检测到物理网卡: $(echo $PHYSICAL_NICS | tr '\n' ' ')"
-    
-    # 检查是否支持 RPS
-    RPS_SUPPORTED=0
-    for nic in $PHYSICAL_NICS; do
-        if [ -d /sys/class/net/$nic/queues ]; then
-            RPS_QUEUE=$(ls -d /sys/class/net/$nic/queues/rx-* 2>/dev/null | head -1)
-            if [ -n "$RPS_QUEUE" ] && [ -f "$RPS_QUEUE/rps_cpus" ]; then
-                RPS_SUPPORTED=1
-                break
-            fi
-        fi
-    done
-    
-    if [ "$RPS_SUPPORTED" -eq 0 ]; then
-        log_warn "网卡不支持 RPS（可能已被驱动处理或单队列网卡）"
-    else
-        # 创建热插拔脚本
-        cat > /etc/hotplug.d/net/40-rps-rfs <<EOF
-#!/bin/sh
-# RPS/RFS 自动配置
-
-[ "\$ACTION" = "add" ] || exit 0
-
-# 仅处理物理网卡
-case "\$INTERFACE" in
-    eth*|lan*|wan*|enp*)
-        # RPS: 启用所有核心处理接收包
-        for queue in /sys/class/net/\$INTERFACE/queues/rx-*/rps_cpus; do
-            [ -f "\$queue" ] && echo "$RPS_MASK" > \$queue 2>/dev/null
-        done
-        
-        # RFS: 流感知
-        for queue in /sys/class/net/\$INTERFACE/queues/rx-*/rps_flow_cnt; do
-            [ -f "\$queue" ] && echo "4096" > \$queue 2>/dev/null
-        done
-        
-        logger -t rps-rfs "Applied RPS/RFS to \$INTERFACE"
-        ;;
-esac
-EOF
-        chmod +x /etc/hotplug.d/net/40-rps-rfs
-        
-        # 立即应用到现有网卡
-        RPS_APPLIED=0
-        for nic in $PHYSICAL_NICS; do
-            if [ -d /sys/class/net/$nic/queues ]; then
-                for queue in /sys/class/net/$nic/queues/rx-*/rps_cpus; do
-                    if [ -f "$queue" ]; then
-                        echo "$RPS_MASK" > $queue 2>/dev/null && RPS_APPLIED=1
-                    fi
-                done
-                for queue in /sys/class/net/$nic/queues/rx-*/rps_flow_cnt; do
-                    if [ -f "$queue" ]; then
-                        echo "4096" > $queue 2>/dev/null
-                    fi
-                done
-            fi
-        done
-        
-        if [ "$RPS_APPLIED" -eq 1 ]; then
-            log_info "✅ RPS/RFS 已启用（掩码: $RPS_MASK）"
-        else
-            log_warn "⚠️  RPS/RFS 配置失败（网卡可能不支持）"
-        fi
-    fi
-fi
-
-# ==================== 阶段 6: 启动项优化 ====================
-log_info ""
-log_info "🔋 [6/7] 启动项与 CPU 调度..."
 backup_file "/etc/rc.local"
 
 cat > /etc/rc.local <<EOF
 #!/bin/sh
-# NanoPC-T6 代理主路由启动脚本 (v20.0)
+# NanoPC-T6 代理主路由启动脚本 (v21.0)
 
 # 等待系统稳定
 sleep 5
@@ -361,44 +263,28 @@ for i in \$(seq 0 $((CPU_CORES - 1))); do
     fi
 done
 
-# 3. RPS/RFS 持久化（多队列网卡优化）
-# 等待网卡就绪
-sleep 2
-for dev in eth1 eth2; do
-    if [ -d /sys/class/net/\$dev/queues ]; then
-        # RPS: 所有核心
-        for queue in /sys/class/net/\$dev/queues/rx-*/rps_cpus; do
-            [ -f "\$queue" ] && echo "$RPS_MASK" > \$queue 2>/dev/null
-        done
-        # RFS: 流感知
-        for queue in /sys/class/net/\$dev/queues/rx-*/rps_flow_cnt; do
-            [ -f "\$queue" ] && echo "4096" > \$queue 2>/dev/null
-        done
-    fi
-done
-
-# 注意: irqbalance 已禁用，使用 RPS 代替（多队列网卡更优）
+# 注意: 网卡驱动已自动优化多核分发，无需手动配置
 
 exit 0
 EOF
 
 chmod +x /etc/rc.local
-/etc/rc.local >/dev/null 2>&1 || log_warn "部分启动项未立即生效（重启后完整生效）"
+/etc/rc.local >/dev/null 2>&1 || log_warn "部分配置未立即生效（重启后完整生效）"
 log_info "✅ 启动项已配置 | 调频: $CPU_GOVERNOR"
 
-# ==================== 阶段 7: irqbalance ====================
+# ==================== 阶段 6: 清理冲突组件 ====================
 log_info ""
-log_info "⚖️ [7/7] 中断优化配置..."
+log_info "🗑️ [6/6] 清理冲突组件..."
 
-# 多队列网卡使用 RPS 更好，禁用 irqbalance 避免冲突
-log_info "检测到多队列网卡（eth1/eth2 各 4 队列）"
-log_info "使用 RPS 代替 irqbalance（更适合多队列网卡）"
-
-# 禁用 irqbalance
-if [ -f /etc/init.d/irqbalance ]; then
+# 确保 irqbalance 被禁用（如果存在）
+if opkg list-installed 2>/dev/null | grep -q "^irqbalance "; then
+    log_warn "检测到 irqbalance，正在移除..."
     /etc/init.d/irqbalance stop 2>/dev/null || true
     /etc/init.d/irqbalance disable 2>/dev/null || true
-    log_info "✅ 已禁用 irqbalance（避免与 RPS 冲突）"
+    opkg remove irqbalance --force-removal-of-dependent-packages >/dev/null 2>&1 || true
+    log_info "✅ irqbalance 已移除（避免冲突）"
+else
+    log_info "✅ 无冲突组件"
 fi
 
 # ==================== 最终验证 ====================
@@ -431,20 +317,10 @@ if [ "$CONNTRACK_MAX" -gt 0 ]; then
     log_info "📊 连接跟踪: $CONNTRACK_CUR / $CONNTRACK_MAX (${CONNTRACK_PCT}%)"
 fi
 
-# RPS 验证（动态检测网卡）
-RPS_STATUS="未配置"
-for nic in $(ls /sys/class/net 2>/dev/null | grep -E '^(eth|enp|wan|lan)[0-9]' | head -1); do
-    RPS_FILE="/sys/class/net/$nic/queues/rx-0/rps_cpus"
-    if [ -f "$RPS_FILE" ]; then
-        RPS_STATUS="$(cat $RPS_FILE 2>/dev/null) (网卡: $nic)"
-        break
-    fi
-done
-
-if [ "$RPS_STATUS" = "未配置" ]; then
-    log_warn "⚠️  RPS: 网卡不支持或已被驱动优化"
-else
-    log_info "🔥 RPS 状态: $RPS_STATUS (目标: $RPS_MASK)"
+# 网卡队列
+NICS=$(ls /sys/class/net 2>/dev/null | grep -E '^eth[0-9]' | head -2 | tr '\n' ' ')
+if [ -n "$NICS" ]; then
+    log_info "🔥 网卡队列: $NICS(驱动已自动优化)"
 fi
 
 # 网络
@@ -454,19 +330,19 @@ else
     log_warn "⚠️  网络: 异常"
 fi
 
-log_info "==========================================="
+log_info "========================================="
 log_info ""
 log_info "🎉 优化完成！NanoPC-T6 已配置为高性能代理主路由。"
 log_info ""
 log_info "📋 配置摘要:"
 log_info "  • 连接跟踪: 52万（代理优化）"
 log_info "  • 网络缓冲: 32MB（16GB 内存优化）"
-log_info "  • 多核处理: RPS/RFS 已启用"
 log_info "  • BBR 加速: 已启用 + 代理参数"
 log_info "  • FullCone NAT: 已启用"
+log_info "  • 无冲突组件: 已清理"
 log_info ""
 log_info "🔧 下一步操作:"
-log_info "  1. 【重要】重启系统: reboot"
+log_info "  1. 【建议】重启系统: reboot"
 log_info "  2. 安装代理软件:"
 log_info "     - OpenClash: opkg install luci-app-openclash"
 log_info "     - HomeProxy: opkg install luci-app-homeproxy"
@@ -474,14 +350,13 @@ log_info "     - PassWall: opkg install luci-app-passwall"
 log_info "  3. 验证优化效果:"
 log_info "     sysctl net.ipv4.tcp_congestion_control"
 log_info "     cat /proc/sys/net/netfilter/nf_conntrack_max"
-log_info "     ls /sys/class/net/  # 查看网卡名称"
-log_info "     cat /sys/class/net/\$(ls /sys/class/net/ | grep -E '^eth|^enp' | head -1)/queues/rx-0/rps_cpus 2>/dev/null || echo '网卡不支持RPS'"
 log_info ""
 log_info "📁 备份位置: $BACKUP_DIR"
 log_info "📋 详细日志: $LOG_FILE"
 log_info ""
 log_info "⚠️  提示:"
 log_info "  • 本脚本已为代理场景优化，无需额外调整"
+log_info "  • 网卡驱动已自动优化多核分发"
 log_info "  • 如需恢复: cp -r $BACKUP_DIR/* /etc/ && reboot"
 log_info "  • 支持重复运行，配置错误时可重新执行"
-log_info "==========================================="
+log_info "========================================="
