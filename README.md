@@ -47,6 +47,8 @@
 
 ### 更新软件包
 ```bash
+opkg update
+opkg list-upgradable
 opkg upgrade
 ```
 ### 一键执行
