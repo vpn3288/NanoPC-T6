@@ -73,13 +73,18 @@ reboot
 
 ## 🧪 验证测试
 
-### 1. BBR 验证
+# 1. 验证 RPS（最关键）
+cat /sys/class/net/eth1/queues/rx-*/rps_cpus
+cat /sys/class/net/eth2/queues/rx-*/rps_cpus
+# 应该全部显示: ff
+
+### 2. BBR 验证
 ```bash
 sysctl net.ipv4.tcp_congestion_control
 # 预期: net.ipv4.tcp_congestion_control = bbr
 ```
 
-### 2. 连接跟踪验证
+### 3. 连接跟踪验证
 ```bash
 cat /proc/sys/net/netfilter/nf_conntrack_max
 # 预期: 524288
@@ -88,45 +93,45 @@ cat /proc/sys/net/netfilter/nf_conntrack_count
 # 当前连接数
 ```
 
-### 3. 网络缓冲验证
+### 4. 网络缓冲验证
 ```bash
 sysctl net.core.rmem_max net.core.wmem_max
 # 预期: 33554432 (32MB)
 ```
 
-### 4. TCP Fast Open 验证
+### 5. TCP Fast Open 验证
 ```bash
 sysctl net.ipv4.tcp_fastopen
 # 预期: 3
 ```
 
-### 5. CPU 调频验证
+### 6. CPU 调频验证
 ```bash
 cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 # 预期: 8个 schedutil
 ```
 
-### 6. CPU 温度监控
+### 7. CPU 温度监控
 ```bash
 cat /sys/class/thermal/thermal_zone0/temp
 # 输出: 毫度（除以 1000 = 摄氏度）
 # 正常: 30000-45000 (30-45°C)
 ```
 
-### 7. DNS 解析测试
+### 8. DNS 解析测试
 ```bash
 time nslookup baidu.com
 # 首次: ~50ms
 # 缓存后: ~10ms
 ```
 
-### 8. 网络延迟测试
+### 9. 网络延迟测试
 ```bash
 ping -c 10 223.5.5.5
 ping -c 10 8.8.8.8
 ```
 
-### 9. 网卡状态
+### 10. 网卡状态
 ```bash
 # 查看网卡列表
 ls /sys/class/net/
@@ -141,7 +146,7 @@ ethtool eth1 | grep Speed
 # 预期: Speed: 2500Mb/s
 ```
 
-### 10. 带宽测试
+### 11. 带宽测试
 ```bash
 # 安装 iperf3
 opkg install iperf3
@@ -154,7 +159,7 @@ iperf3 -c <服务器IP> -t 30
 # 预期: 2.3-2.4 Gbps
 ```
 
-### 11. 实时连接监控
+### 12. 实时连接监控
 ```bash
 while true; do 
   echo "连接: $(cat /proc/sys/net/netfilter/nf_conntrack_count) / $(cat /proc/sys/net/netfilter/nf_conntrack_max)"
@@ -162,7 +167,7 @@ while true; do
 done
 ```
 
-### 12. CPU 使用率
+### 13. CPU 使用率
 ```bash
 # 安装 htop
 opkg install htop
@@ -172,7 +177,7 @@ htop
 top
 ```
 
-### 13. 内存状态
+### 14. 内存状态
 ```bash
 free -h
 
@@ -180,20 +185,20 @@ free -h
 cat /proc/meminfo | grep -E 'MemTotal|MemFree|MemAvailable'
 ```
 
-### 14. 系统负载
+### 15. 系统负载
 ```bash
 uptime
 # 负载应 < 8（8核心系统）
 ```
 
-### 15. 磁盘使用
+### 16. 磁盘使用
 ```bash
 df -h
 # 关注 /overlay 使用率
 # 建议: < 80%
 ```
 
-### 16. 防火墙状态
+### 17. 防火墙状态
 ```bash
 # 查看 FullCone NAT
 nft list table inet fw4 | grep fullcone
@@ -206,7 +211,7 @@ uci show firewall.@defaults[0] | grep offload
 # firewall.@defaults[0].flow_offloading_hw='1'
 ```
 
-### 17. 活动连接统计
+### 18. 活动连接统计
 ```bash
 # TCP 连接状态
 netstat -ant | awk '{print $6}' | sort | uniq -c | sort -rn
@@ -215,7 +220,7 @@ netstat -ant | awk '{print $6}' | sort | uniq -c | sort -rn
 #   50 TIME_WAIT
 ```
 
-### 18. 路由表
+### 19. 路由表
 ```bash
 # 查看路由
 ip route show
@@ -224,14 +229,14 @@ ip route show
 ip route show default
 ```
 
-### 19. 网卡队列长度
+### 20. 网卡队列长度
 ```bash
 ip link show eth1 | grep qlen
 ip link show eth2 | grep qlen
 # 预期: qlen 5000
 ```
 
-### 20. 系统日志
+### 21. 系统日志
 ```bash
 # 实时日志
 logread -f
@@ -243,7 +248,7 @@ logread | grep dnsmasq
 logread | grep firewall
 ```
 
-### 21. 内核模块
+### 22. 内核模块
 ```bash
 # BBR 模块
 lsmod | grep tcp_bbr
@@ -252,23 +257,23 @@ lsmod | grep tcp_bbr
 lsmod | grep nf_conntrack
 ```
 
-### 22. TCP 统计
+### 23. TCP 统计
 ```bash
 netstat -s | grep -A 10 Tcp
 ```
 
-### 23. 网络接口统计
+### 24. 网络接口统计
 ```bash
 ip -s link show eth1
 ip -s link show eth2
 ```
 
-### 24. 中断分布
+### 25. 中断分布
 ```bash
 cat /proc/interrupts | grep -E "eth|GIC"
 ```
 
-### 25. DNS 缓存统计
+### 26. DNS 缓存统计
 ```bash
 # dnsmasq 状态
 kill -USR1 $(pidof dnsmasq)
