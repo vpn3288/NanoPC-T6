@@ -47,11 +47,7 @@
 
 ### 更新软件包
 ```bash
-opkg update
-
-opkg list-upgradable
-
-opkg upgrade
+opkg update && opkg install bash
 ```
 ### 一键执行
 ```bash
