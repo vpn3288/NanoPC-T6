@@ -47,7 +47,7 @@
 
 ### 更新软件包
 ```bash
-opkg upgrade luci-app-openclash
+opkg upgrade
 ```
 ### 一键执行
 ```bash
