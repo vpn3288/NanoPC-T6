@@ -74,9 +74,11 @@ reboot
 ## 🧪 验证测试
 
 # 1. 验证 RPS（最关键）
+```bash
 cat /sys/class/net/eth1/queues/rx-*/rps_cpus
 cat /sys/class/net/eth2/queues/rx-*/rps_cpus
 # 应该全部显示: ff
+```
 
 ### 2. BBR 验证
 ```bash
